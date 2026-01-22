@@ -664,6 +664,13 @@ int main(int argc, const char** argv)
 
     assert_vk(vkCreateSwapchainKHR(vk.device, &swapchainCI, nullptr, &window.swapchain));
 
+    VkLatencySleepModeInfoNV sleepModeInfo{};
+    sleepModeInfo.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
+    sleepModeInfo.lowLatencyMode = true;
+    sleepModeInfo.lowLatencyBoost = true;
+    sleepModeInfo.minimumIntervalUs = 1000000 / 60;
+    vkSetLatencySleepModeNV(vk.device, window.swapchain, &sleepModeInfo);
+
     uint32_t imageCount = 0;
     vkGetSwapchainImagesKHR(vk.device, window.swapchain, &imageCount, nullptr);
     window.swapchainImages.resize(imageCount);
@@ -705,7 +712,6 @@ int main(int argc, const char** argv)
 
     VkSemaphoreCreateInfo semaphoreCI{};
     semaphoreCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-
 
     VkSemaphoreTypeCreateInfo semaphoreTypeCI{};
     semaphoreTypeCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
@@ -1154,6 +1160,7 @@ int main(int argc, const char** argv)
       vkDestroyFence(vk.device, window.renderFences[i], nullptr);
       vkDestroySemaphore(vk.device, window.acquireSemaphores[i], nullptr);
       vkDestroySemaphore(vk.device, window.renderSemaphores[i], nullptr);
+      vkDestroySemaphore(vk.device, window.lowLatencySemaphores[i], nullptr);
       vmaUnmapMemory(vk.allocator, window.shaderDataBuffers[i].allocation);
       vmaDestroyBuffer(vk.allocator, window.shaderDataBuffers[i].buffer, window.shaderDataBuffers[i].allocation);
     }
