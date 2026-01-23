@@ -9,13 +9,15 @@
 #include <vector>
 #include <windows.h>
 
-#include <tracy/tracy.hpp>
-
+#include <vulkan/vulkan.h>
 #include <volk.h>
 #include <vulkan/vk_enum_string_helper.h>
 #define VMA_IMPLEMENTATION
 #include <vma/vk_mem_alloc.h>
 #undef VMA_IMPLEMENTATION
+
+#include <tracy/tracy.hpp>
+#include <tracy/TracyVulkan.hpp>
 
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
@@ -126,6 +128,8 @@ struct VulkanState
   VmaAllocation vBufferAlloc = VK_NULL_HANDLE;
   // In the global state because low_latency2 only works with one window anyway.
   std::array<VkSemaphore, maxFramesInFlight> lowLatencySemaphores{};
+
+  TracyVkCtx tracyCtx;
 };
 
 static VulkanState vk{};
@@ -541,6 +545,7 @@ int main(int argc, const char** argv)
   enabledVk12Features.runtimeDescriptorArray = true;
   enabledVk12Features.bufferDeviceAddress = true;
   enabledVk12Features.timelineSemaphore = true;
+  enabledVk12Features.hostQueryReset = true; // Required for simpler tracy Vulkan profiling.
 
   VkPhysicalDeviceVulkan13Features enabledVk13Features{};
   enabledVk13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -560,8 +565,13 @@ int main(int argc, const char** argv)
   // See https://github.com/shader-slang/slang/issues/7562 for a possibly similar issue someone had.
   enabledVk10Features.shaderInt64 = true;
 
-  const std::vector<const char*> deviceExtensions { VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_KHR_PRESENT_ID_EXTENSION_NAME,
-                                                    VK_NV_LOW_LATENCY_2_EXTENSION_NAME };
+  const std::vector<const char*> deviceExtensions
+    {
+      VK_KHR_SWAPCHAIN_EXTENSION_NAME, // We want to present things
+      VK_KHR_PRESENT_ID_EXTENSION_NAME, // Required as a dependency to low_latency2
+      VK_NV_LOW_LATENCY_2_EXTENSION_NAME, // Measure and minimise our frame latency
+      VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME, // This allows us to get sensibly aligned GPU profiling in tracy.
+  };
 
   VkDeviceCreateInfo deviceCI{};
   deviceCI.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -574,7 +584,29 @@ int main(int argc, const char** argv)
 
   assert_vk(vkCreateDevice(devices[deviceIndex], &deviceCI, nullptr, &vk.device));
 
+  {
+    uint32_t numTimeDomains = 0;
+    assert_vk(vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(devices[deviceIndex], &numTimeDomains, nullptr));
+    std::vector<VkTimeDomainKHR> timeDomains(numTimeDomains);
+    assert_vk(vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(devices[deviceIndex], &numTimeDomains, timeDomains.data()));
+
+    bool hasPerfCounter = false;
+    for (auto timeDomain : timeDomains) {
+      if (timeDomain == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR) {
+        hasPerfCounter = true;
+        break;
+      }
+    }
+    if (!hasPerfCounter) {
+      assert(!"Missing the performance counter calibrateable time domain, tracy Vulkan profiling will not work correctly.");
+    }
+  }
+
   vkGetDeviceQueue(vk.device, queueFamily, 0, &vk.queue);
+
+  vk.tracyCtx = TracyVkContextHostCalibrated(devices[deviceIndex], vk.device,
+                                             vkResetQueryPool, vkGetPhysicalDeviceCalibrateableTimeDomainsKHR,
+                                             vkGetCalibratedTimestampsKHR);
 
   // Vulkan Memory Allocator
   VmaVulkanFunctions vkFunctions{};
@@ -1012,84 +1044,89 @@ int main(int argc, const char** argv)
         cbBI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cb, &cbBI);
 
-        VkImageMemoryBarrier2 outputBarrier{};
-        outputBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        outputBarrier.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        outputBarrier.srcAccessMask = 0;
-        outputBarrier.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        outputBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        outputBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        outputBarrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
-        outputBarrier.image = window.swapchainImages[imageIdx];
-        outputBarrier.subresourceRange = VkImageSubresourceRange{};
-        outputBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        outputBarrier.subresourceRange.levelCount = 1;
-        outputBarrier.subresourceRange.layerCount = 1;
+        {
+          TracyVkZone(vk.tracyCtx, cb, "rendering");
 
-        VkDependencyInfo outputBarrierDI{};
-        outputBarrierDI.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        outputBarrierDI.imageMemoryBarrierCount = 1;
-        outputBarrierDI.pImageMemoryBarriers = &outputBarrier;
-        vkCmdPipelineBarrier2(cb, &outputBarrierDI);
+          VkImageMemoryBarrier2 outputBarrier{};
+          outputBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+          outputBarrier.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+          outputBarrier.srcAccessMask = 0;
+          outputBarrier.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+          outputBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+          outputBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+          outputBarrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+          outputBarrier.image = window.swapchainImages[imageIdx];
+          outputBarrier.subresourceRange = VkImageSubresourceRange{};
+          outputBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+          outputBarrier.subresourceRange.levelCount = 1;
+          outputBarrier.subresourceRange.layerCount = 1;
 
-        VkRenderingAttachmentInfo colorAttachmentInfo{};
-        colorAttachmentInfo.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAttachmentInfo.imageView = window.swapchainImageViews[imageIdx];
-        colorAttachmentInfo.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
-        colorAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        colorAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        colorAttachmentInfo.clearValue = VkClearValue{};
-        colorAttachmentInfo.clearValue.color = VkClearColorValue{0.0f, 0.0f, 0.0f, 1.0f};
+          VkDependencyInfo outputBarrierDI{};
+          outputBarrierDI.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+          outputBarrierDI.imageMemoryBarrierCount = 1;
+          outputBarrierDI.pImageMemoryBarriers = &outputBarrier;
+          vkCmdPipelineBarrier2(cb, &outputBarrierDI);
 
-        VkRenderingInfo renderingInfo{};
-        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        renderingInfo.renderArea = VkRect2D{};
-        renderingInfo.renderArea.extent = VkExtent2D{(uint32_t) window.width, (uint32_t) window.height};
-        renderingInfo.layerCount = 1;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachments = &colorAttachmentInfo;
-        vkCmdBeginRendering(cb, &renderingInfo);
+          VkRenderingAttachmentInfo colorAttachmentInfo{};
+          colorAttachmentInfo.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+          colorAttachmentInfo.imageView = window.swapchainImageViews[imageIdx];
+          colorAttachmentInfo.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+          colorAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          colorAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+          colorAttachmentInfo.clearValue = VkClearValue{};
+          colorAttachmentInfo.clearValue.color = VkClearColorValue{0.0f, 0.0f, 0.0f, 1.0f};
 
-        VkViewport vp{};
-        vp.width = static_cast<float>(window.width);
-        vp.height = static_cast<float>(window.height);
-        vp.minDepth = 0.0f;
-        vp.maxDepth = 1.0f;
-        vkCmdSetViewport(cb, 0, 1, &vp);
-        VkRect2D scissor{};
-        scissor.extent = VkExtent2D{(uint32_t) window.width, (uint32_t) window.height};
-        vkCmdSetScissor(cb, 0, 1, &scissor);
+          VkRenderingInfo renderingInfo{};
+          renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+          renderingInfo.renderArea = VkRect2D{};
+          renderingInfo.renderArea.extent = VkExtent2D{(uint32_t) window.width, (uint32_t) window.height};
+          renderingInfo.layerCount = 1;
+          renderingInfo.colorAttachmentCount = 1;
+          renderingInfo.pColorAttachments = &colorAttachmentInfo;
+          vkCmdBeginRendering(cb, &renderingInfo);
 
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipeline);
-        VkDeviceSize vOffset = 0;
-        vkCmdBindVertexBuffers(cb, 0, 1, &vk.vBuffer, &vOffset);
-        vkCmdBindIndexBuffer(cb, vk.vBuffer, vk.vDataSize, VK_INDEX_TYPE_UINT16);
+          VkViewport vp{};
+          vp.width = static_cast<float>(window.width);
+          vp.height = static_cast<float>(window.height);
+          vp.minDepth = 0.0f;
+          vp.maxDepth = 1.0f;
+          vkCmdSetViewport(cb, 0, 1, &vp);
+          VkRect2D scissor{};
+          scissor.extent = VkExtent2D{(uint32_t) window.width, (uint32_t) window.height};
+          vkCmdSetScissor(cb, 0, 1, &scissor);
 
-        vkCmdPushConstants(cb, vk.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof(VkDeviceAddress), &window.shaderDataBuffers[resourceIdx].deviceAddress);
+          vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipeline);
+          VkDeviceSize vOffset = 0;
+          vkCmdBindVertexBuffers(cb, 0, 1, &vk.vBuffer, &vOffset);
+          vkCmdBindIndexBuffer(cb, vk.vBuffer, vk.vDataSize, VK_INDEX_TYPE_UINT16);
 
-        vkCmdDrawIndexed(cb, vk.numIndices, 1, 0, 0, 0);
-        vkCmdEndRendering(cb);
+          vkCmdPushConstants(cb, vk.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                             sizeof(VkDeviceAddress), &window.shaderDataBuffers[resourceIdx].deviceAddress);
 
-        VkImageMemoryBarrier2 barrierPresent{};
-        barrierPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-        barrierPresent.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        barrierPresent.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        barrierPresent.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        barrierPresent.dstAccessMask = 0;
-        barrierPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        barrierPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barrierPresent.image = window.swapchainImages[imageIdx];
-        barrierPresent.subresourceRange = VkImageSubresourceRange{};
-        barrierPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrierPresent.subresourceRange.levelCount = 1;
-        barrierPresent.subresourceRange.layerCount = 1;
+          vkCmdDrawIndexed(cb, vk.numIndices, 1, 0, 0, 0);
+          vkCmdEndRendering(cb);
 
-        VkDependencyInfo barrierPresentDI{};
-        barrierPresentDI.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-        barrierPresentDI.imageMemoryBarrierCount = 1;
-        barrierPresentDI.pImageMemoryBarriers = &barrierPresent;
-        vkCmdPipelineBarrier2(cb, &barrierPresentDI);
+          VkImageMemoryBarrier2 barrierPresent{};
+          barrierPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+          barrierPresent.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+          barrierPresent.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+          barrierPresent.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+          barrierPresent.dstAccessMask = 0;
+          barrierPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+          barrierPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+          barrierPresent.image = window.swapchainImages[imageIdx];
+          barrierPresent.subresourceRange = VkImageSubresourceRange{};
+          barrierPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+          barrierPresent.subresourceRange.levelCount = 1;
+          barrierPresent.subresourceRange.layerCount = 1;
+
+          VkDependencyInfo barrierPresentDI{};
+          barrierPresentDI.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+          barrierPresentDI.imageMemoryBarrierCount = 1;
+          barrierPresentDI.pImageMemoryBarriers = &barrierPresent;
+          vkCmdPipelineBarrier2(cb, &barrierPresentDI);
+
+        }
 
         vkEndCommandBuffer(cb);
 
@@ -1169,6 +1206,8 @@ int main(int argc, const char** argv)
 
     latencyMarkerInfo.marker = VK_LATENCY_MARKER_SIMULATION_END_NV;
     vkSetLatencyMarkerNV(vk.device, windows[0].swapchain, &latencyMarkerInfo);
+
+    TracyVkCollectHost(vk.tracyCtx);
 
     {
       VkGetLatencyMarkerInfoNV markerInfo{};
@@ -1272,6 +1311,7 @@ int main(int argc, const char** argv)
   vkDestroyCommandPool(vk.device, vk.commandPool, nullptr);
   vkDestroyShaderModule(vk.device, vk.shaderModule, nullptr);
   vmaDestroyAllocator(vk.allocator);
+  TracyVkDestroy(vk.tracyCtx);
   vkDestroyDevice(vk.device, nullptr);
   vkDestroyInstance(vk.instance, nullptr);
 
