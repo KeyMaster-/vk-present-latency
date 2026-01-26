@@ -165,6 +165,7 @@ static std::vector<Window> windows;
 static bool s_run = true;
 static bool s_advance = true;
 static bool s_advanceOnce = false;
+static bool s_drainPresentQueue = false;
 static int s_frameCount = 0;
 
 static LRESULT WindowProc(HWND handle, UINT message, WPARAM wparam, LPARAM lparam)
@@ -216,6 +217,10 @@ static LRESULT WindowProc(HWND handle, UINT message, WPARAM wparam, LPARAM lpara
 
       if ((wparam == VK_RIGHT) && pressed) {
         s_advanceOnce = true;
+      }
+
+      if ((wparam == 'D') && pressed) {
+        s_drainPresentQueue = true;
       }
     } break;
   }
@@ -375,7 +380,7 @@ float2 rand2(inout uint s) {
 
 [shader("fragment")]
 float4 main(VSOutput input, uniform ShaderData* shaderData) {
-  if (input.uv.x < 0.1 || input.uv.x > 0.9) {
+  if (input.uv.x < 0.2 || input.uv.x > 0.8) {
     return float4(1.0, 0.0, 0.0, 1.0);
   }
 
@@ -431,7 +436,6 @@ int main(int argc, const char** argv)
     Log("Only using the first two monitors.");
     monitorRects.resize(2);
   }
-  monitorRects.resize(1);
 
   const char* className = RegisterWindowClass();
   if (!className) return EXIT_FAILURE;
@@ -931,10 +935,6 @@ int main(int argc, const char** argv)
     }
   };
 
-  uint32_t skipCounter = 0;
-  constexpr uint32_t numRenderFrames = 12;
-  constexpr uint32_t frameCyclePeriod = 12;
-
   VkSetLatencyMarkerInfoNV latencyMarkerInfo{};
   latencyMarkerInfo.sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV;
   std::vector<VkLatencyTimingsFrameReportNV> latencyReports;
@@ -944,15 +944,6 @@ int main(int argc, const char** argv)
   auto frameStart = std::chrono::high_resolution_clock::now();
   while (s_run) {
     FrameMark;
-
-    if (skipCounter % frameCyclePeriod >= numRenderFrames) {
-      ZoneScopedN("non-render frame");
-      Spinloop(16.6);
-      PumpMessages();
-
-      skipCounter++;
-      continue;
-    }
 
     auto frameEnd = frameStart;
     frameStart = std::chrono::high_resolution_clock::now();
@@ -1169,7 +1160,6 @@ int main(int argc, const char** argv)
       for (size_t i = 0; i < swapchainCount; i++) {
         semaphores[i] = windows[i].renderSemaphores[imageIdxs[i]];
         swapchains[i] = windows[i].swapchain;
-        // Generate unique present IDs per swapchain, because low_latency2 does not take a swapchain to identify which one to wait on.
         presentIds[i] = presentId;
       }
 
@@ -1202,7 +1192,18 @@ int main(int argc, const char** argv)
     s_advanceOnce = false;
 
     s_frameCount++;
-    skipCounter++;
+
+    {
+      constexpr uint32_t numQueueDrainFrames = 6;
+      if (s_drainPresentQueue) {
+        for (int i = 0; i < numQueueDrainFrames; i++) {
+          ZoneScopedN("non-render frame");
+          Spinloop(40);
+          PumpMessages();
+        }
+        s_drainPresentQueue = false;
+      }
+    }
 
     latencyMarkerInfo.marker = VK_LATENCY_MARKER_SIMULATION_END_NV;
     vkSetLatencyMarkerNV(vk.device, windows[0].swapchain, &latencyMarkerInfo);
