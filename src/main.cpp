@@ -1,3 +1,6 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX 1
+
 #include <array>
 #include <assert.h>
 #include <chrono>
@@ -7,24 +10,17 @@
 #include <time.h>
 #include <varargs.h>
 #include <vector>
+
 #include <windows.h>
-
-#include <vulkan/vulkan.h>
-#include <volk.h>
-#include <vulkan/vk_enum_string_helper.h>
-#define VMA_IMPLEMENTATION
-#include <vma/vk_mem_alloc.h>
-#undef VMA_IMPLEMENTATION
-
 #include <tracy/tracy.hpp>
-#include <tracy/TracyVulkan.hpp>
 
-#define GLM_FORCE_RADIANS
-#define GLM_FORCE_DEPTH_ZERO_TO_ONE
-#include <glm/glm.hpp>
-
-#include "slang/slang.h"
-#include "slang/slang-com-ptr.h"
+#include <dxgi1_4.h>
+#include <d3d12.h>
+#include <d3d12sdklayers.h>
+#include <d3dcompiler.h>
+#include <d3dx12/d3dx12.h>
+#include <DirectXMath.h>
+#include "ComUtils.h"
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
@@ -87,18 +83,6 @@ bool check_hr(HRESULT hr)
 #define assert_hr_(name, exp) HRESULT name = exp; UNUSED_VARIABLE(name); assert(check_hr(name))
 #define assert_hr(exp) assert_hr_(CONCAT(___hr, __COUNTER__), exp)
 
-bool check_vk(VkResult result)
-{
-  if (result != VK_SUCCESS) {
-    Log("Vulkan error (code %d): %s", result, string_VkResult(result));
-    return false;
-  }
-  return true;
-}
-
-#define assert_vk_(name, exp) VkResult name = exp; UNUSED_VARIABLE(name); assert(check_vk(name))
-#define assert_vk(exp) assert_vk_(CONCAT(___vk, __COUNTER__), exp)
-
 static void Spinloop(double ms) {
   ZoneScoped;
 
@@ -111,53 +95,126 @@ static void Spinloop(double ms) {
 }
 
 constexpr uint32_t maxFramesInFlight = 2;
+constexpr uint32_t numBackbuffers = maxFramesInFlight;
 
-struct VulkanState
+struct Vertex
 {
-  VkInstance instance = VK_NULL_HANDLE;
-  VkDevice device = VK_NULL_HANDLE;
-  VkQueue queue = VK_NULL_HANDLE;
-  VmaAllocator allocator = VK_NULL_HANDLE;
-  VkCommandPool commandPool = VK_NULL_HANDLE;
-  VkShaderModule shaderModule{};
-  VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  VkDeviceSize vDataSize = 0;
-  uint32_t numIndices = 0;
-  VkBuffer vBuffer = VK_NULL_HANDLE; // Contains vertex and index data
-  VmaAllocation vBufferAlloc = VK_NULL_HANDLE;
-  // In the global state because low_latency2 only works with one window anyway.
-  std::array<VkSemaphore, maxFramesInFlight> lowLatencySemaphores{};
-
-  TracyVkCtx tracyCtx;
+    DirectX::XMFLOAT2 pos;
+    DirectX::XMFLOAT2 uv;
 };
 
-static VulkanState vk{};
-
-struct ShaderDataBuffer
-{
-  VmaAllocation allocation = VK_NULL_HANDLE;
-  VkBuffer buffer = VK_NULL_HANDLE;
-  VkDeviceAddress deviceAddress = 0;
-  void* mapped = nullptr;
+struct ShaderData {
+    float rectXform_r1[3]; [[maybe_unused]] float _pad1;
+    float rectXform_r2[3]; [[maybe_unused]] float _pad2;
+    float rectXform_r3[3];
+    uint32_t metaLoopCount;
+    [[maybe_unused]] float _padding[64 - 12]; // Pad to 256-byte alignment
 };
+static_assert(sizeof(ShaderData) == 256); // Check for exact size to make sure we don't waste space on extra padding.
+
+struct DxState
+{
+    ComPtr<ID3D12Device> device;
+    ComPtr<ID3D12CommandQueue> commandQueue;
+
+    UINT rtvDescriptorSize;
+    UINT cbvDescriptorSize;
+
+    ComPtr<ID3D12DescriptorHeap> rtvHeap;
+    ComPtr<ID3D12DescriptorHeap> cbvHeap;
+    ComPtr<ID3D12RootSignature> rootSignature;
+    ComPtr<ID3D12PipelineState> pipelineState;
+    ComPtr<ID3D12Resource> vertexBuffer;
+    D3D12_VERTEX_BUFFER_VIEW vertexBufferView;
+
+    UINT64 nextFenceValue;
+    UINT64 fenceValues[maxFramesInFlight];
+    ComPtr<ID3D12Fence> fence;
+    HANDLE fenceEvent;
+};
+static DxState dx{};
+
+const char kShader[] = R"shader(
+#define BROT_LOOP_COUNT 200
+cbuffer ShaderData : register(b0)
+{
+  float3x3 rectXform;
+  uint metaLoopCount;
+  float4 _pad[13]; // (64-12)/4
+};
+
+struct PSInput
+{
+    float4 pos : SV_POSITION;
+    float2 uv : TEXCOORD;
+};
+
+PSInput VSMain(float4 pos : POSITION, float4 uv : TEXCOORD)
+{
+    PSInput result;
+    float3 p = float3(pos.xy, 1.0);
+    p = mul(p, rectXform);
+    result.pos = float4(p.xy, 0.0, 1.0);
+    result.uv = uv.xy;
+    return result;
+}
+
+float mandelbrot(float2 c) {
+  float2 z = float2(0.0, 0.0);
+  for (int i = 0; i < BROT_LOOP_COUNT; i++) {
+    z = float2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
+    if (z.x*z.x + z.y*z.y > 4) break;
+  }
+  float grade = 0.0;
+  if (i < BROT_LOOP_COUNT) {
+    grade = float(i) / float(BROT_LOOP_COUNT);
+  }
+  return grade;
+}
+
+// Takes our seed, updates it, and returns a pseudorandom float in [0..1]
+float nextRand(inout uint s) {
+  s = (1664525u * s + 1013904223u);
+  return float(s & 0x00FFFFFF) / float(0x01000000);
+}
+float2 rand2(inout uint s) {
+  return float2(nextRand(s), nextRand(s));
+}
+
+float4 PSMain(PSInput input) : SV_TARGET
+{
+  if (input.uv.x < 0.25 || input.uv.x > 0.75) {
+    return float4(1.0, 0.0, 0.0, 1.0);
+  }
+
+  float grade = 0.0;
+  uint seed = (uint)input.pos.x;
+  for (uint i = 0; i < metaLoopCount; i++) {
+    float2 p = input.uv + rand2(seed) / float2(1920, 1080);
+    float2 c = float2(-2.5 + p.x * 3.5, -1.0 + p.y * 2.0);
+    grade += mandelbrot(c);
+  }
+  grade = grade / float(metaLoopCount);
+  return float4(0.0, grade, grade, 1.0);
+}
+)shader";
 
 struct Window
 {
-  HWND handle = NULL;
-  int width = 0;
-  int height = 0;
+    HWND handle = NULL;
+    int width = 0;
+    int height = 0;
 
-  VkSurfaceKHR surface = VK_NULL_HANDLE;
-  VkSwapchainKHR swapchain = VK_NULL_HANDLE;
-  std::vector<VkImage> swapchainImages{};
-  std::vector<VkImageView> swapchainImageViews{};
-  std::vector<VkSemaphore> renderSemaphores{};
-  std::array<VkSemaphore, maxFramesInFlight> acquireSemaphores{};
-  std::array<VkFence, maxFramesInFlight> acquireFences{};
-  std::array<ShaderDataBuffer, maxFramesInFlight> shaderDataBuffers{};
-  std::array<VkFence, maxFramesInFlight> renderFences{};
-  std::array<VkCommandBuffer, maxFramesInFlight> commandBuffers{};
+    ComPtr<ID3D12GraphicsCommandList> commandList;
+    ComPtr<IDXGISwapChain3> swapchain;
+    HANDLE latencyWaitable;
+    ComPtr<ID3D12Resource> renderTargets[numBackbuffers];
+    ComPtr<ID3D12CommandAllocator> commandAllocators[maxFramesInFlight];
+    ComPtr<ID3D12Resource> constantBuffers[maxFramesInFlight];
+    ShaderData* mappedShaderDatas[maxFramesInFlight];
+
+    bool isFullscreen = false;
+    bool resizeBuffers = false;
 };
 
 static std::vector<Window> windows;
@@ -167,6 +224,43 @@ static bool s_advance = true;
 static bool s_advanceOnce = false;
 static bool s_drainPresentQueue = false;
 static int s_frameCount = 0;
+
+static RECT GetDesktopRect(IDXGISwapChain* swapchain, RECT windowRect)
+{
+  ComPtr<IDXGIOutput> output;
+  DXGI_OUTPUT_DESC outputDesc;
+
+  HRESULT hr = swapchain->GetContainingOutput(&output);
+  if (hr == S_OK) {
+    assert_hr(output->GetDesc(&outputDesc));
+    return outputDesc.DesktopCoordinates;
+  }
+
+  // GetContainingOutput may fail, in which case we have to manually iterate all adapter>output pairs and
+  // search for the best intersection with the window rectangle.
+  ComPtr<IDXGIFactory4> dxgiFactory;
+  assert_hr(CreateDXGIFactory2(0, IID_PPV_ARGS(&dxgiFactory)));
+  ComPtr<IDXGIAdapter1> adapter;
+  for (UINT adapterIdx = 0; SUCCEEDED(dxgiFactory->EnumAdapters1(adapterIdx, &adapter)); adapterIdx++) {
+    DXGI_ADAPTER_DESC1 adapterDesc;
+    adapter->GetDesc1(&adapterDesc);
+
+    for (UINT outputIdx = 0; SUCCEEDED(adapter->EnumOutputs(outputIdx, &output)); outputIdx++) {
+      assert_hr(output->GetDesc(&outputDesc));
+
+      if (outputDesc.DesktopCoordinates.left <= windowRect.left &&
+          windowRect.left < outputDesc.DesktopCoordinates.right &&
+          outputDesc.DesktopCoordinates.top <= windowRect.top &&
+          windowRect.top < outputDesc.DesktopCoordinates.bottom) {
+        return outputDesc.DesktopCoordinates;
+      }
+    }
+  }
+  assert(!"Could not find desktop rect for window");
+  return { 0, 0, 1920, 1080 };
+}
+
+static void OnResize(size_t winIdx);
 
 static LRESULT WindowProc(HWND handle, UINT message, WPARAM wparam, LPARAM lparam)
 {
@@ -182,10 +276,12 @@ static LRESULT WindowProc(HWND handle, UINT message, WPARAM wparam, LPARAM lpara
 
     case WM_SIZE: {
       if (wparam != SIZE_MINIMIZED) {
-        for (Window& window : windows) {
+        for (size_t i = 0; i < windows.size(); i++) {
+          Window& window = windows[i];
           if (window.handle != handle) continue;
           window.width = LOWORD(lparam);
           window.height = HIWORD(lparam);
+          OnResize(i);
         }
       }
     } break;
@@ -221,6 +317,42 @@ static LRESULT WindowProc(HWND handle, UINT message, WPARAM wparam, LPARAM lpara
 
       if ((wparam == 'D') && pressed) {
         s_drainPresentQueue = true;
+      }
+
+      if ((wparam == 'F') && pressed) {
+        for (size_t i = 0; i < windows.size(); i++) {
+          Window& window = windows[i];
+          if (!window.swapchain) continue;
+
+          RECT windowRect;
+          ::GetWindowRect(window.handle, &windowRect);
+          RECT desktopRect = GetDesktopRect(window.swapchain.get(), windowRect);
+
+          if (window.isFullscreen) {
+            //            ::SetWindowLongPtr(window.handle, GWL_STYLE, WS_OVERLAPPEDWINDOW);
+            ::SetWindowPos(window.handle,
+                           HWND_NOTOPMOST,
+                           desktopRect.left + 100, desktopRect.top + 100,
+                           1920,
+                           1080,
+                           SWP_FRAMECHANGED | SWP_NOACTIVATE);
+            ::ShowWindow(window.handle, SW_NORMAL);
+          }
+          else {
+            //            ::SetWindowLongPtr(window.handle, GWL_STYLE, WS_VISIBLE|WS_POPUP);
+            ::SetWindowPos(window.handle,
+                           HWND_TOPMOST,
+                           desktopRect.left,
+                           desktopRect.top,
+                           desktopRect.right - desktopRect.left,
+                           desktopRect.bottom - desktopRect.top,
+                           SWP_FRAMECHANGED | SWP_NOACTIVATE); // FRAMECHANGED needed to apply window style set above.
+            ::ShowWindow(window.handle, SW_SHOW);
+          }
+
+          window.isFullscreen = !window.isFullscreen;
+          window.resizeBuffers = true;
+        }
       }
     } break;
   }
@@ -266,7 +398,7 @@ static bool createWindow(const char* className, int idx, std::array<long, 4> rec
   windows[idx] = Window{};
 
   // WS_POPUP for borderless.
-  DWORD style = WS_CLIPSIBLINGS|WS_CLIPCHILDREN|WS_VISIBLE|WS_SYSMENU|WS_MINIMIZEBOX|WS_POPUP;
+  DWORD style = WS_VISIBLE|WS_POPUP;
   DWORD exstyle = WS_EX_APPWINDOW;
   HINSTANCE module = ::GetModuleHandle(NULL);
   HWND windowHandle = ::CreateWindowEx(exstyle, className, "Dual Output Sync Tester", style,
@@ -304,99 +436,9 @@ static bool createWindow(const char* className, int idx, std::array<long, 4> rec
 
 static void destroyWindow(Window& window)
 {
+  ::CloseHandle(window.latencyWaitable);
   ::DestroyWindow(window.handle);
 }
-
-struct Vertex
-{
-  glm::vec2 pos;
-  glm::vec2 uv;
-};
-
-struct ShaderData
-{
-  glm::mat4 rectXform{};
-  uint64_t maxMetaLoop = 1;
-};
-
-static constexpr char kShader[] = R"shader(
-struct VSInput {
-  float2 pos;
-  float2 uv;
-};
-
-struct ShaderData {
-  // This should only be a 3x3 matrix since we only need a 2D xy transform.
-  // However Vulkan doesn't like the 12-byte alignment of the elements of a 3x3 matrix, so we
-  // go with a 4x4 here.
-  float4x4 rectXform;
-  // Using uint64_t here to avoid potential issues around member alignment/size.
-  uint64_t maxMetaLoop;
-};
-
-struct VSOutput {
-  float4 pos : SV_POSITION;
-  float2 uv;
-};
-
-[shader("vertex")]
-VSOutput main(VSInput input, uniform ShaderData* shaderData) {
-  VSOutput output;
-  float4 p = float4(input.pos, 0.0, 1.0);
-  p = mul(shaderData->rectXform, p);
-  output.pos = float4(p.xy, 0.0, 1.0);
-  output.uv = input.uv;
-  return output;
-}
-
-#define MAX_BROT 200
-
-float mandelbrot(float2 c) {
-  float2 z = float2(0.0, 0.0);
-  int i = 0;
-  for (; i < MAX_BROT; i++) {
-    z = float2(z.x*z.x - z.y*z.y, 2.0*z.x*z.y) + c;
-    if (z.x*z.x + z.y*z.y > 4) break;
-  }
-
-  float grade = 0.0;
-  if (i < MAX_BROT) {
-    grade = float(i) / float(MAX_BROT);
-  }
-
-  return grade;
-}
-
-
-// Takes our seed, updates it, and returns a pseudorandom float in [0..1]
-float nextRand(inout uint s) {
-    s = (1664525u * s + 1013904223u);
-    return float(s & 0x00FFFFFF) / float(0x01000000);
-}
-
-float2 rand2(inout uint s) {
-  return float2(nextRand(s), nextRand(s));
-}
-
-[shader("fragment")]
-float4 main(VSOutput input, uniform ShaderData* shaderData) {
-  if (input.uv.x < 0.2 || input.uv.x > 0.8) {
-    return float4(1.0, 0.0, 0.0, 1.0);
-  }
-
-  float grade = 0.0;
-  uint seed = (uint)input.pos.x + (uint)input.pos.y;
-  for (int i = 0; i < shaderData->maxMetaLoop; i++) {
-    float2 p = input.uv + rand2(seed) / float2(1920, 1080);
-    float2 c = float2(-2.5 + p.x * 3.5, -1.0 + p.y * 2.0);
-    grade += mandelbrot(c);
-  }
-
-  grade = grade / float(shaderData->maxMetaLoop);
-
-  return float4(0.0, grade, grade, 1.0);
-}
-)shader";
 
 int main(int argc, const char** argv)
 {
@@ -404,10 +446,10 @@ int main(int argc, const char** argv)
 
   std::vector<HMONITOR> monitors;
   auto monitorEnumProc = [](HMONITOR monitor, HDC hdc, LPRECT rect, LPARAM param) -> int {
-    UNUSED_VARIABLE(hdc, rect);
-    auto ms = reinterpret_cast<std::vector<HMONITOR>*>(param);
-    ms->emplace_back(monitor);
-    return true;
+      UNUSED_VARIABLE(hdc, rect);
+      auto ms = reinterpret_cast<std::vector<HMONITOR>*>(param);
+      ms->emplace_back(monitor);
+      return true;
   };
   ::EnumDisplayMonitors(NULL, NULL, monitorEnumProc, reinterpret_cast<LPARAM>(&monitors));
 
@@ -448,497 +490,279 @@ int main(int argc, const char** argv)
     }
   }
 
-  // Vulkan init
-  // Stuff we need to do before we can create windows and associated resources.
-  assert_vk(volkInitialize());
-
-  VkApplicationInfo appInfo{};
-  appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-  appInfo.pApplicationName = "Dual Output Sync Tester";
-  appInfo.apiVersion = VK_API_VERSION_1_3;
-
-  // Taken from SFML's getGraphicsRequiredInstanceExtensions() for win32
-  const std::vector<const char*> instanceExtensions { VK_KHR_SURFACE_EXTENSION_NAME,
-                                                      VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
-
-  VkInstanceCreateInfo instCI {};
-  instCI.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-  instCI.pApplicationInfo = &appInfo;
-  instCI.enabledExtensionCount = static_cast<uint32_t>(instanceExtensions.size());
-  instCI.ppEnabledExtensionNames = instanceExtensions.data();
-
-  assert_vk(vkCreateInstance(&instCI, nullptr, &vk.instance));
-  volkLoadInstance(vk.instance);
-
-  // Make our surfaces, because it's required for finding a presentation queue.
-  for (Window& window : windows) {
-    VkWin32SurfaceCreateInfoKHR surfaceCI{};
-    surfaceCI.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-    surfaceCI.hinstance = ::GetModuleHandle(nullptr);
-    surfaceCI.hwnd = window.handle;
-
-    vkCreateWin32SurfaceKHR(vk.instance, &surfaceCI, nullptr, &window.surface);
-  }
-
-  // Get devices
-  uint32_t deviceCount = 0;
-  assert_vk(vkEnumeratePhysicalDevices(vk.instance, &deviceCount, nullptr));
-  std::vector<VkPhysicalDevice> devices(deviceCount);
-  assert_vk(vkEnumeratePhysicalDevices(vk.instance, &deviceCount, devices.data()));
-
-  uint32_t deviceIndex = UINT32_MAX;
-  for (uint32_t i = 0; i < deviceCount; i++) {
-    VkPhysicalDeviceProperties deviceProps{};
-    vkGetPhysicalDeviceProperties(devices[i], &deviceProps);
-    if (deviceProps.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-      deviceIndex = i;
-      break;
-    }
-  }
-  if (deviceIndex == UINT32_MAX) {
-    assert(!"Couldn't find an integrated GPU device.");
-    return EXIT_FAILURE;
-  }
-
-  uint32_t queueFamilyCount = 0;
-  vkGetPhysicalDeviceQueueFamilyProperties(devices[deviceIndex], &queueFamilyCount, nullptr);
-  std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
-  vkGetPhysicalDeviceQueueFamilyProperties(devices[deviceIndex], &queueFamilyCount, queueFamilies.data());
-
-  uint32_t queueFamily = UINT32_MAX;
-  for (size_t i = 0; i < queueFamilies.size(); i++) {
-    if (!(queueFamilies[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
-
-    bool supportsPresentation = true;
-    for (Window& window : windows) {
-      VkBool32 supportsPresentationForWindow = false;
-      assert_vk(vkGetPhysicalDeviceSurfaceSupportKHR(devices[deviceIndex], static_cast<uint32_t>(i),
-                                                     window.surface, &supportsPresentationForWindow));
-      if (!supportsPresentationForWindow) {
-        supportsPresentation = false;
-        break;
-      }
-
-      // We do not check for support for low_latency2 here, because when I tried to use
-      // vkPhysicalDeviceGetSurfaceCapabilities2KHR with a VkLatencySurfaceCapabilitiesNV in the input chain,
-      // I didn't get any useful data out - it just didn't seem to write anything.
-    }
-    if (!supportsPresentation) continue;
-
-    queueFamily = static_cast<uint32_t>(i);
-    break;
-  }
-  if (queueFamily == UINT32_MAX) {
-    Log("No viable graphics queue was found.");
-    return EXIT_FAILURE;
-  }
-
-  // Create device and queue
-  const float qfPriorities = 1.0f; // We'll just make a single graphics queue
-  VkDeviceQueueCreateInfo queueCI{};
-  queueCI.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-  queueCI.queueFamilyIndex = queueFamily;
-  queueCI.queueCount = 1;
-  queueCI.pQueuePriorities = &qfPriorities;
-
-  // TODO: review what's needed of the below
-  VkPhysicalDeviceVulkan12Features enabledVk12Features{};
-  enabledVk12Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-  enabledVk12Features.descriptorIndexing = true;
-  enabledVk12Features.descriptorBindingVariableDescriptorCount = true;
-  enabledVk12Features.runtimeDescriptorArray = true;
-  enabledVk12Features.bufferDeviceAddress = true;
-  enabledVk12Features.timelineSemaphore = true;
-  enabledVk12Features.hostQueryReset = true; // Required for simpler tracy Vulkan profiling.
-
-  VkPhysicalDeviceVulkan13Features enabledVk13Features{};
-  enabledVk13Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-  enabledVk13Features.pNext = &enabledVk12Features;
-  enabledVk13Features.synchronization2 = true;
-  enabledVk13Features.dynamicRendering = true;
-
-  VkPhysicalDevicePresentIdFeaturesKHR presentIdFeatures{};
-  presentIdFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
-  presentIdFeatures.pNext = &enabledVk13Features;
-  presentIdFeatures.presentId = true;
-
-  VkPhysicalDeviceFeatures enabledVk10Features {};
-  enabledVk10Features.samplerAnisotropy = true;
-  // This seems to be required because the Slang compiler outputs SPIR-V that declares the `Int64` capability.
-  // I'm not quite sure what in our shader makes it declare that capability, for now this should be an easy enough workaround.
-  // See https://github.com/shader-slang/slang/issues/7562 for a possibly similar issue someone had.
-  enabledVk10Features.shaderInt64 = true;
-
-  const std::vector<const char*> deviceExtensions
+  {
+    UINT dxgiFactoryFlags = 0;
+#if defined(FN_DEBUG)
     {
-      VK_KHR_SWAPCHAIN_EXTENSION_NAME, // We want to present things
-      VK_KHR_PRESENT_ID_EXTENSION_NAME, // Required as a dependency to low_latency2
-      VK_NV_LOW_LATENCY_2_EXTENSION_NAME, // Measure and minimise our frame latency
-      VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME, // This allows us to get sensibly aligned GPU profiling in tracy.
-  };
+      ComPtr<ID3D12Debug> debugController;
+      if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
+        debugController->EnableDebugLayer();
+        dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
+      }
 
-  VkDeviceCreateInfo deviceCI{};
-  deviceCI.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  deviceCI.pNext = &presentIdFeatures;
-  deviceCI.queueCreateInfoCount = 1;
-  deviceCI.pQueueCreateInfos = &queueCI;
-  deviceCI.enabledExtensionCount = static_cast<uint32_t>(deviceExtensions.size());
-  deviceCI.ppEnabledExtensionNames = deviceExtensions.data();
-  deviceCI.pEnabledFeatures = &enabledVk10Features;
+      ComPtr<ID3D12Debug5> debug5;
+      assert_hr(debugController->QueryInterface(IID_PPV_ARGS(&debug5)));
+      debug5->SetEnableAutoName(true);
+    }
+#endif
+    ComPtr<IDXGIFactory4> dxgiFactory;
+    assert_hr(CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&dxgiFactory)));
+    ComPtr<IDXGIAdapter1> adapter;
+    {
+      for (UINT adapterIdx = 0; SUCCEEDED(dxgiFactory->EnumAdapters1(adapterIdx, &adapter)); adapterIdx++) {
+        DXGI_ADAPTER_DESC1 desc;
+        adapter->GetDesc1(&desc);
 
-  assert_vk(vkCreateDevice(devices[deviceIndex], &deviceCI, nullptr, &vk.device));
+        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+          continue;
+        }
 
-  {
-    uint32_t numTimeDomains = 0;
-    assert_vk(vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(devices[deviceIndex], &numTimeDomains, nullptr));
-    std::vector<VkTimeDomainKHR> timeDomains(numTimeDomains);
-    assert_vk(vkGetPhysicalDeviceCalibrateableTimeDomainsKHR(devices[deviceIndex], &numTimeDomains, timeDomains.data()));
-
-    bool hasPerfCounter = false;
-    for (auto timeDomain : timeDomains) {
-      if (timeDomain == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR) {
-        hasPerfCounter = true;
-        break;
+        if (SUCCEEDED(D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_12_0, _uuidof(ID3D12Device), nullptr))) {
+          break;
+        }
       }
     }
-    if (!hasPerfCounter) {
-      assert(!"Missing the performance counter calibrateable time domain, tracy Vulkan profiling will not work correctly.");
-    }
-  }
+    assert_hr(D3D12CreateDevice(adapter.get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dx.device)));
 
-  vkGetDeviceQueue(vk.device, queueFamily, 0, &vk.queue);
+    D3D12_COMMAND_QUEUE_DESC queueDesc{};
+    queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 
-  vk.tracyCtx = TracyVkContextHostCalibrated(devices[deviceIndex], vk.device,
-                                             vkResetQueryPool, vkGetPhysicalDeviceCalibrateableTimeDomainsKHR,
-                                             vkGetCalibratedTimestampsKHR);
+    assert_hr(dx.device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&dx.commandQueue)));
+    dx.commandQueue->SetName(L"commandQueue");
 
-  // Vulkan Memory Allocator
-  VmaVulkanFunctions vkFunctions{};
-  vkFunctions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
-  vkFunctions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-  vkFunctions.vkCreateImage = vkCreateImage;
+    {
+      D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
+      rtvHeapDesc.NumDescriptors = static_cast<UINT>(windows.size() * numBackbuffers);
+      rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+      rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+      assert_hr(dx.device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&dx.rtvHeap)));
+      dx.rtvHeap->SetName(L"rtvHeap");
 
-  VmaAllocatorCreateInfo allocatorCI{};
-  allocatorCI.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-  allocatorCI.physicalDevice = devices[deviceIndex];
-  allocatorCI.device = vk.device;
-  allocatorCI.pVulkanFunctions = &vkFunctions;
-  allocatorCI.instance = vk.instance;
+      dx.rtvDescriptorSize = dx.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
-  assert_vk(vmaCreateAllocator(&allocatorCI, &vk.allocator));
+      D3D12_DESCRIPTOR_HEAP_DESC cbvHeapDesc{};
+      cbvHeapDesc.NumDescriptors = static_cast<UINT>(windows.size() * maxFramesInFlight);
+      cbvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+      cbvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+      assert_hr(dx.device->CreateDescriptorHeap(&cbvHeapDesc, IID_PPV_ARGS(&dx.cbvHeap)));
+      dx.cbvHeap->SetName(L"cbvHeap");
 
-  VkCommandPoolCreateInfo commandPoolCI{};
-  commandPoolCI.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-  commandPoolCI.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  commandPoolCI.queueFamilyIndex = queueFamily;
-  assert_vk(vkCreateCommandPool(vk.device, &commandPoolCI, nullptr, &vk.commandPool));
-
-  {
-    std::vector<Vertex> vertices;
-    std::vector<uint16_t> indices;
-
-    for (int i = 0; i < 4; i++) {
-      Vertex v{};
-      v.pos.x = (float)(i % 2);
-      v.pos.y = (float)(i / 2);
-      v.uv = v.pos;
-
-      vertices.push_back(v);
+      dx.cbvDescriptorSize = dx.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     }
 
-    // Assuming x+ right, y+ up, ccw winding
-    indices.push_back(0);
-    indices.push_back(1);
-    indices.push_back(2);
-    indices.push_back(1);
-    indices.push_back(3);
-    indices.push_back(2);
+    {
+      CD3DX12_DESCRIPTOR_RANGE1 ranges[1];
+      CD3DX12_ROOT_PARAMETER1 rootParameters[1];
+      ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 1, 0, 0, D3D12_DESCRIPTOR_RANGE_FLAG_DATA_STATIC);
+      rootParameters[0].InitAsDescriptorTable(1, &ranges[0], D3D12_SHADER_VISIBILITY_ALL);
 
-    vk.numIndices = static_cast<uint32_t>(indices.size());
-    vk.vDataSize = sizeof(Vertex) * vertices.size();
-    VkDeviceSize iDataSize = sizeof(uint16_t) * indices.size();
+      D3D12_ROOT_SIGNATURE_FLAGS rootSignatureFlags =
+        D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+        D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
 
-    VkBufferCreateInfo bufferCI{};
-    bufferCI.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferCI.size = static_cast<VkDeviceSize>(vk.vDataSize + iDataSize);
-    bufferCI.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+      CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+      rootSignatureDesc.Init_1_1(static_cast<UINT>(ArrayCount(rootParameters)), rootParameters, 0, nullptr, rootSignatureFlags);
 
-    VmaAllocationCreateInfo bufferAllocCI{};
-    bufferAllocCI.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-    bufferAllocCI.usage = VMA_MEMORY_USAGE_AUTO;
-
-    assert_vk(vmaCreateBuffer(vk.allocator, &bufferCI, &bufferAllocCI, &vk.vBuffer, &vk.vBufferAlloc, nullptr));
-
-    void* bufferPtr = nullptr;
-    vmaMapMemory(vk.allocator, vk.vBufferAlloc, &bufferPtr);
-    memcpy(bufferPtr, vertices.data(), vk.vDataSize);
-    memcpy(((uint8_t*)bufferPtr) + vk.vDataSize, indices.data(), iDataSize);
-    vmaUnmapMemory(vk.allocator, vk.vBufferAlloc);
-  }
-
-  {
-    VkSemaphoreTypeCreateInfo semaphoreTypeCI{};
-    semaphoreTypeCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
-    semaphoreTypeCI.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    VkSemaphoreCreateInfo timelineSemaphoreCI{};
-    timelineSemaphoreCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    timelineSemaphoreCI.pNext = &semaphoreTypeCI;
-
-    for (int i = 0; i < maxFramesInFlight; i++) {
-      assert_vk(vkCreateSemaphore(vk.device, &timelineSemaphoreCI, nullptr, &vk.lowLatencySemaphores[i]));
-    }
-  }
-
-  const VkFormat swapchainImageFormat = VK_FORMAT_B8G8R8A8_SRGB;
-  for (size_t i = 0; i < windows.size(); i++) {
-    Window& window = windows[i];
-
-    VkSurfaceCapabilitiesKHR surfaceCaps{};
-    assert_vk(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(devices[deviceIndex], window.surface, &surfaceCaps));
-
-    VkSwapchainLatencyCreateInfoNV latencyCI{};
-    latencyCI.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV;
-    latencyCI.latencyModeEnable = true;
-
-    VkSwapchainCreateInfoKHR swapchainCI{};
-    swapchainCI.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-    swapchainCI.pNext = i == 0 ? &latencyCI : nullptr;
-    swapchainCI.surface = window.surface;
-    swapchainCI.minImageCount = surfaceCaps.minImageCount;
-    swapchainCI.imageFormat = swapchainImageFormat;
-    swapchainCI.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
-    swapchainCI.imageExtent = VkExtent2D { surfaceCaps.currentExtent.width, surfaceCaps.currentExtent.height };
-    swapchainCI.imageArrayLayers = 1;
-    swapchainCI.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    swapchainCI.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-    swapchainCI.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    swapchainCI.presentMode = VK_PRESENT_MODE_FIFO_KHR;
-
-    assert_vk(vkCreateSwapchainKHR(vk.device, &swapchainCI, nullptr, &window.swapchain));
-
-    uint32_t imageCount = 0;
-    vkGetSwapchainImagesKHR(vk.device, window.swapchain, &imageCount, nullptr);
-    window.swapchainImages.resize(imageCount);
-    vkGetSwapchainImagesKHR(vk.device, window.swapchain, &imageCount, window.swapchainImages.data());
-
-    window.swapchainImageViews.resize(imageCount);
-    for (uint32_t i = 0; i < imageCount; i++) {
-      VkImageViewCreateInfo viewCI{};
-      viewCI.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-      viewCI.image = window.swapchainImages[i];
-      viewCI.viewType = VK_IMAGE_VIEW_TYPE_2D;
-      viewCI.format = swapchainImageFormat;
-      viewCI.subresourceRange = VkImageSubresourceRange{};
-      viewCI.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      viewCI.subresourceRange.levelCount = 1;
-      viewCI.subresourceRange.layerCount = 1;
-      assert_vk(vkCreateImageView(vk.device, &viewCI, nullptr, &window.swapchainImageViews[i]));
+      ComPtr<ID3DBlob> signature;
+      ComPtr<ID3DBlob> error;
+      assert_hr(D3DX12SerializeVersionedRootSignature(&rootSignatureDesc, D3D_ROOT_SIGNATURE_VERSION_1_1, &signature, &error));
+      assert_hr(dx.device->CreateRootSignature(0, signature->GetBufferPointer(), signature->GetBufferSize(), IID_PPV_ARGS(&dx.rootSignature)));
     }
 
-    for (ShaderDataBuffer& sdb : window.shaderDataBuffers) {
-      VkBufferCreateInfo bufferCI2{};
-      bufferCI2.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-      bufferCI2.size = sizeof(ShaderData);
-      bufferCI2.usage = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    {
+      ComPtr<ID3DBlob> vertexShader;
+      ComPtr<ID3DBlob> pixelShader;
+#if defined(FN_DEBUG)
+      // Enable better shader debugging with the graphics debugging tools.
+      UINT compileFlags = D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+      UINT compileFlags = 0;
+#endif
+      auto CompileShader = [&](const char* entry, const char* target, ID3DBlob** out) {
+          ComPtr<ID3DBlob> errors;
+          D3DCompile(kShader, ArrayCount(kShader), "shader.hlsl", nullptr, nullptr, entry, target, compileFlags, 0, out, &errors);
 
-      VmaAllocationCreateInfo bufferAllocCI2{};
-      bufferAllocCI2.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                             VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-      bufferAllocCI2.usage = VMA_MEMORY_USAGE_AUTO;
-      assert_vk(vmaCreateBuffer(vk.allocator, &bufferCI2, &bufferAllocCI2, &sdb.buffer,
-                                &sdb.allocation, nullptr));
-      vmaMapMemory(vk.allocator, sdb.allocation, &sdb.mapped);
+          if (errors) {
+            Log("Shader compiler error: %s", reinterpret_cast<char*>(errors->GetBufferPointer()));
+            assert(false);
+          }
+      };
+      CompileShader("VSMain", "vs_5_0", &vertexShader);
+      CompileShader("PSMain", "ps_5_0", &pixelShader);
 
-      VkBufferDeviceAddressInfo bufferBdaInfo{};
-      bufferBdaInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-      bufferBdaInfo.buffer = sdb.buffer;
-      sdb.deviceAddress = vkGetBufferDeviceAddress(vk.device, &bufferBdaInfo);
+      D3D12_INPUT_ELEMENT_DESC inputElementDescs[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+      };
+
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc{};
+      psoDesc.InputLayout = { inputElementDescs, static_cast<UINT>(ArrayCount(inputElementDescs)) };
+      psoDesc.pRootSignature = dx.rootSignature.get();
+      psoDesc.VS = CD3DX12_SHADER_BYTECODE(vertexShader.get());
+      psoDesc.PS = CD3DX12_SHADER_BYTECODE(pixelShader.get());
+      psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
+      psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
+      psoDesc.DepthStencilState.DepthEnable = false;
+      psoDesc.DepthStencilState.StencilEnable = false;
+      psoDesc.SampleMask = UINT_MAX;
+      psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      psoDesc.NumRenderTargets = 1;
+      psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+      psoDesc.SampleDesc.Count = 1;
+      assert_hr(dx.device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&dx.pipelineState)));
     }
 
-    VkSemaphoreCreateInfo semaphoreCI{};
-    semaphoreCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(dx.rtvHeap->GetCPUDescriptorHandleForHeapStart());
+    CD3DX12_CPU_DESCRIPTOR_HANDLE cbvHandle(dx.cbvHeap->GetCPUDescriptorHandleForHeapStart());
 
-    VkFenceCreateInfo fenceCI{};
-    fenceCI.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceCI.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    for (size_t winIdx = 0; winIdx < windows.size(); winIdx++) {
+      Window& window = windows[winIdx];
 
-    for (int i = 0; i < maxFramesInFlight; i++) {
-      assert_vk(vkCreateFence(vk.device, &fenceCI, nullptr, &window.acquireFences[i]));
-      assert_vk(vkCreateFence(vk.device, &fenceCI, nullptr, &window.renderFences[i]));
-      assert_vk(vkCreateSemaphore(vk.device, &semaphoreCI, nullptr, &window.acquireSemaphores[i]));
+      DXGI_SWAP_CHAIN_DESC1 swapchainDesc{};
+      swapchainDesc.BufferCount = numBackbuffers;
+      swapchainDesc.Width = window.width;
+      swapchainDesc.Height = window.height;
+      swapchainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      swapchainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+      swapchainDesc.SampleDesc.Count = 1;
+      swapchainDesc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+
+      ComPtr<IDXGISwapChain1> swapchain;
+      assert_hr(dxgiFactory->CreateSwapChainForHwnd(
+        dx.commandQueue.get(),
+        window.handle,
+        &swapchainDesc,
+        nullptr,
+        nullptr,
+        &swapchain));
+
+      assert_hr(dxgiFactory->MakeWindowAssociation(window.handle, DXGI_MWA_NO_ALT_ENTER));
+      assert_hr(swapchain->QueryInterface(IID_PPV_ARGS(&window.swapchain)));
+
+      window.swapchain->SetMaximumFrameLatency(1);
+      window.latencyWaitable = window.swapchain->GetFrameLatencyWaitableObject();
+      assert(window.latencyWaitable);
+
+      wchar_t name[32];
+      for (uint32_t i = 0; i < numBackbuffers; i++) {
+        assert_hr(window.swapchain->GetBuffer(i, IID_PPV_ARGS(&window.renderTargets[i])));
+        dx.device->CreateRenderTargetView(window.renderTargets[i].get(), nullptr, rtvHandle);
+        swprintf(name, ArrayCount(name), L"window %zu backbuffer %u", winIdx, i);
+
+        window.renderTargets[i]->SetName(name);
+        rtvHandle.Offset(1, dx.rtvDescriptorSize);
+      }
+
+      const UINT cbSize = sizeof(ShaderData);
+      CD3DX12_HEAP_PROPERTIES cbHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+      auto cbResourceDesc = CD3DX12_RESOURCE_DESC::Buffer(cbSize);
+
+      for (UINT i = 0; i < maxFramesInFlight; i++) {
+        assert_hr(dx.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&window.commandAllocators[i])));
+        swprintf(name, ArrayCount(name), L"window %zu command allocator", winIdx);
+
+        {
+          assert_hr(dx.device->CreateCommittedResource(
+            &cbHeapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &cbResourceDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&window.constantBuffers[i])
+          ));
+          swprintf(name, ArrayCount(name), L"window %zu constant buffer %u", winIdx, i);
+          window.constantBuffers[i]->SetName(name);
+
+          D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc{};
+          cbvDesc.BufferLocation = window.constantBuffers[i]->GetGPUVirtualAddress();
+          cbvDesc.SizeInBytes = cbSize;
+          dx.device->CreateConstantBufferView(&cbvDesc, cbvHandle);
+          cbvHandle.Offset(1, dx.cbvDescriptorSize);
+
+          CD3DX12_RANGE readRange(0, 0);
+          // We keep this mapped for the duration of the program.
+          assert_hr(window.constantBuffers[i]->Map(0, &readRange, reinterpret_cast<void**>(&window.mappedShaderDatas[i])));
+        }
+      }
+
+      assert_hr(dx.device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+        // The choice of allocator is arbitrary, we just need one for creation. It'll get reset in the render loop.
+        window.commandAllocators[0].get(), dx.pipelineState.get(), IID_PPV_ARGS(&window.commandList)));
+      swprintf(name, ArrayCount(name), L"window %zu command list", winIdx);
+      window.commandList->SetName(name);
+
+      // Command lists get created open, but we want it closed for the main loop, so close now.
+      assert_hr(window.commandList->Close());
     }
 
-    window.renderSemaphores.resize(window.swapchainImages.size());
-    for (auto& semaphore : window.renderSemaphores) {
-      assert_vk(vkCreateSemaphore(vk.device, &semaphoreCI, nullptr, &semaphore));
+    {
+      DirectX::XMFLOAT2 corners[] = {
+        { 0.0f, 0.0f },
+        { 1.0f, 0.0f },
+        { 0.0f, 1.0f },
+        { 1.0f, 1.0f },
+      };
+
+      std::vector<Vertex> verts;
+      verts.reserve(6);
+      for (size_t idx : { 0, 2, 1, 1, 2, 3 }) {
+        DirectX::XMFLOAT2 p = corners[idx];
+        p.x = p.x * 2.0f - 1.0f;
+        p.y = p.y * 2.0f - 1.0f;
+        verts.push_back(Vertex { p, corners[idx] });
+      }
+      size_t bufferSize = verts.size() * sizeof(Vertex);
+
+      // Using an upload buffer is not very efficient, moving this on the GPU to a default buffer would be better.
+      // But our data is small, so we don't care for the moment.
+      CD3DX12_HEAP_PROPERTIES heapProps(D3D12_HEAP_TYPE_UPLOAD);
+      auto resourceDesc = CD3DX12_RESOURCE_DESC::Buffer(bufferSize);
+      assert_hr(dx.device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &resourceDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&dx.vertexBuffer)
+      ));
+      dx.vertexBuffer->SetName(L"vertex buffer");
+
+      uint8_t* bufferAddr;
+      CD3DX12_RANGE readRange(0, 0);
+      assert_hr(dx.vertexBuffer->Map(0, &readRange, reinterpret_cast<void**>(&bufferAddr)));
+      memcpy(bufferAddr, verts.data(), bufferSize);
+      dx.vertexBuffer->Unmap(0, nullptr);
+
+      dx.vertexBufferView.BufferLocation = dx.vertexBuffer->GetGPUVirtualAddress();
+      dx.vertexBufferView.StrideInBytes = sizeof(Vertex);
+      dx.vertexBufferView.SizeInBytes = static_cast<UINT>(bufferSize);
     }
 
-    VkCommandBufferAllocateInfo cbAllocCI{};
-    cbAllocCI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbAllocCI.commandPool = vk.commandPool;
-    cbAllocCI.commandBufferCount = maxFramesInFlight;
-    assert_vk(vkAllocateCommandBuffers(vk.device, &cbAllocCI, window.commandBuffers.data()));
-  }
-
-  VkLatencySleepModeInfoNV sleepModeInfo{};
-  sleepModeInfo.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_MODE_INFO_NV;
-  sleepModeInfo.lowLatencyMode = true;
-  sleepModeInfo.lowLatencyBoost = true;
-  sleepModeInfo.minimumIntervalUs = 1000000 / 60;
-  vkSetLatencySleepModeNV(vk.device, windows[0].swapchain, &sleepModeInfo);
-
-  {
-    // Slang
-    Slang::ComPtr<slang::IGlobalSession> slangGlobalSession;
-    slang::createGlobalSession(slangGlobalSession.writeRef());
-
-    slang::TargetDesc target{};
-    target.format = SLANG_SPIRV;
-    target.profile = slangGlobalSession->findProfile("spirv_1_4");
-
-    slang::CompilerOptionEntry slangOption{};
-    slangOption.name = slang::CompilerOptionName::EmitSpirvDirectly;
-    slangOption.value.kind = slang::CompilerOptionValueKind::Int;
-    slangOption.value.intValue0 = 1;
-
-    slang::SessionDesc slangSessionDesc{};
-    slangSessionDesc.targets = &target;
-    slangSessionDesc.targetCount = SlangInt(1);
-    slangSessionDesc.defaultMatrixLayoutMode = SLANG_MATRIX_LAYOUT_COLUMN_MAJOR;
-    slangSessionDesc.compilerOptionEntries = &slangOption;
-    slangSessionDesc.compilerOptionEntryCount = uint32_t(1);
-
-    Slang::ComPtr<slang::ISession> slangSession;
-    assert(SLANG_SUCCEEDED(slangGlobalSession->createSession(slangSessionDesc, slangSession.writeRef())));
-
-    Slang::ComPtr<slang::IModule> slangModule;
-    Slang::ComPtr<ISlangBlob> slangDiagnostics;
-    slangModule = slangSession->loadModuleFromSourceString("rect", "rect.slang", kShader, slangDiagnostics.writeRef());
-    if (slangDiagnostics) {
-      auto diagnosticMessage = reinterpret_cast<const char*>(slangDiagnostics->getBufferPointer());
-      Log("Slang compiler diagnostics:\n%s", diagnosticMessage);
-      assert(!"Slang compilation failed, see log!");
+    {
+      assert_hr(dx.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&dx.fence)));
+      dx.fence->SetName(L"frame fence");
+      dx.nextFenceValue = 1;
+      dx.fenceEvent = ::CreateEvent(nullptr, false, false, nullptr);
+      if (!dx.fenceEvent) {
+        assert_hr(HRESULT_FROM_WIN32(::GetLastError()));
+      }
     }
-
-    Slang::ComPtr<ISlangBlob> spirv;
-    slangModule->getTargetCode(0, spirv.writeRef());
-
-    VkShaderModuleCreateInfo shaderModuleCI{};
-    shaderModuleCI.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    shaderModuleCI.codeSize = spirv->getBufferSize();
-    shaderModuleCI.pCode = (uint32_t*)spirv->getBufferPointer();
-    assert_vk(vkCreateShaderModule(vk.device, &shaderModuleCI, nullptr, &vk.shaderModule));
-  }
-
-  { // pipeline
-    VkPushConstantRange pushConstantRange{};
-    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT;
-    pushConstantRange.size = sizeof(VkDeviceAddress);
-
-    VkPipelineLayoutCreateInfo pipelineLayoutCI{};
-    pipelineLayoutCI.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutCI.pushConstantRangeCount = 1;
-    pipelineLayoutCI.pPushConstantRanges = &pushConstantRange;
-
-    assert_vk(vkCreatePipelineLayout(vk.device, &pipelineLayoutCI, nullptr, &vk.pipelineLayout));
-
-    VkVertexInputBindingDescription vertexBinding{};
-    vertexBinding.binding   = 0;
-    vertexBinding.stride    = sizeof(Vertex);
-    vertexBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    std::vector<VkVertexInputAttributeDescription> vertexAttributes{};
-    vertexAttributes.emplace_back(VkVertexInputAttributeDescription
-                                    { 0, 0, VK_FORMAT_R32G32_SFLOAT, static_cast<uint32_t>(offsetof(Vertex, pos)) });
-    vertexAttributes.emplace_back(VkVertexInputAttributeDescription
-                                    { 1, 0, VK_FORMAT_R32G32_SFLOAT, static_cast<uint32_t>(offsetof(Vertex, uv))  });
-
-    VkPipelineVertexInputStateCreateInfo vertexInputState{};
-    vertexInputState.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputState.vertexBindingDescriptionCount   = 1;
-    vertexInputState.pVertexBindingDescriptions      = &vertexBinding;
-    vertexInputState.vertexAttributeDescriptionCount = static_cast<uint32_t>(vertexAttributes.size());
-    vertexInputState.pVertexAttributeDescriptions    = vertexAttributes.data();
-
-    VkPipelineInputAssemblyStateCreateInfo inputAssemblyState{};
-    inputAssemblyState.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    inputAssemblyState.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    std::vector<VkPipelineShaderStageCreateInfo> shaderStages{};
-    VkPipelineShaderStageCreateInfo stageCI{};
-    stageCI.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stageCI.stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stageCI.module = vk.shaderModule;
-    stageCI.pName = "main";
-    shaderStages.push_back(stageCI);
-    stageCI.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    shaderStages.push_back(stageCI);
-
-    VkPipelineViewportStateCreateInfo viewportState{};
-    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewportState.viewportCount = 1;
-    viewportState.scissorCount = 1;
-
-    std::vector<VkDynamicState> dynamicStates{ VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
-    VkPipelineDynamicStateCreateInfo dynamicState{};
-    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
-    dynamicState.pDynamicStates = dynamicStates.data();
-
-    VkPipelineRenderingCreateInfo renderingCI{};
-    renderingCI.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
-    renderingCI.colorAttachmentCount = 1;
-    renderingCI.pColorAttachmentFormats = &swapchainImageFormat;
-    // No depth attachment, skipping that since we won't need it.
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = 0xF;
-    VkPipelineColorBlendStateCreateInfo colorBlendState{};
-    colorBlendState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlendState.attachmentCount = 1;
-    colorBlendState.pAttachments = &blendAttachment;
-
-    VkPipelineRasterizationStateCreateInfo rasterizationState{};
-    rasterizationState.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    rasterizationState.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisampleState{};
-    multisampleState.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisampleState.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkGraphicsPipelineCreateInfo pipelineCI{};
-    pipelineCI.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipelineCI.pNext = &renderingCI;
-    pipelineCI.stageCount = static_cast<uint32_t>(shaderStages.size());
-    pipelineCI.pStages = shaderStages.data();
-    pipelineCI.pVertexInputState = &vertexInputState;
-    pipelineCI.pInputAssemblyState = &inputAssemblyState;
-    pipelineCI.pViewportState = &viewportState;
-    pipelineCI.pRasterizationState = &rasterizationState;
-    pipelineCI.pMultisampleState = &multisampleState;
-    pipelineCI.pColorBlendState = &colorBlendState;
-    pipelineCI.pDynamicState = &dynamicState;
-    pipelineCI.layout = vk.pipelineLayout;
-
-    assert_vk(vkCreateGraphicsPipelines(vk.device, VK_NULL_HANDLE, 1, &pipelineCI, nullptr, &vk.pipeline));
   }
 
   auto PumpMessages = []() {
-    ZoneScopedN("PumpMessages");
-    for (int i = 0; i < windows.size(); i++) {
-      Log("  Pumping messages for window %d", i);
-      MSG message;
-      while (::PeekMessage(&message, windows[i].handle, 0, 0, PM_REMOVE)) {
-        ::TranslateMessage(&message);
-        ::DispatchMessage(&message);
+      ZoneScopedN("PumpMessages");
+      for (int i = 0; i < windows.size(); i++) {
+        MSG message;
+        while (::PeekMessage(&message, windows[i].handle, 0, 0, PM_REMOVE)) {
+          ::TranslateMessage(&message);
+          ::DispatchMessage(&message);
+        }
       }
-    }
   };
-
-  VkSetLatencyMarkerInfoNV latencyMarkerInfo{};
-  latencyMarkerInfo.sType = VK_STRUCTURE_TYPE_SET_LATENCY_MARKER_INFO_NV;
-  std::vector<VkLatencyTimingsFrameReportNV> latencyReports;
-  uint64_t loggedLatencyPresentId = 0;
 
   int linePos = 0;
   auto frameStart = std::chrono::high_resolution_clock::now();
@@ -947,242 +771,136 @@ int main(int argc, const char** argv)
 
     auto frameEnd = frameStart;
     frameStart = std::chrono::high_resolution_clock::now();
-    Log("Frame took %.2fms", std::chrono::duration<double, std::milli>(frameStart - frameEnd).count());
-    Log("Beginning local frame %d", s_frameCount);
-
-    uint32_t resourceIdx = s_frameCount % maxFramesInFlight;
-    uint64_t presentId = s_frameCount+1; // +1 because we need it to be non-0. PresentId 0 means "ID not set".
-    latencyMarkerInfo.presentID = presentId;
 
     {
-      ZoneScopedN("wait on fences");
-      // Wait on frame fences of all windows
-      std::vector<VkFence> waitFences(windows.size());
+      ZoneScopedN("wait on latency waitables");
+      std::vector<HANDLE> waitables(windows.size());
       for (size_t i = 0; i < windows.size(); i++) {
-        waitFences[i] = windows[i].renderFences[resourceIdx];
+        waitables[i] = windows[i].latencyWaitable;
       }
-      assert_vk(
-        vkWaitForFences(vk.device, static_cast<uint32_t>(waitFences.size()), waitFences.data(), true, UINT64_MAX));
-      assert_vk(vkResetFences(vk.device, static_cast<uint32_t>(waitFences.size()), waitFences.data()));
+
+      DWORD waitResult = ::WaitForMultipleObjectsEx((DWORD)waitables.size(), waitables.data(), true, 1000, true);
+      if (waitResult == WAIT_FAILED) {
+        Log("Waiting on swapchains failed.");
+      } else if (waitResult == WAIT_TIMEOUT) {
+        Log("Swapchain wait timed out.");
+      } else {
+        assert(WAIT_OBJECT_0 <= waitResult && waitResult < WAIT_OBJECT_0 + waitables.size());
+      }
     }
+
+    const UINT resourceIdx = s_frameCount % maxFramesInFlight;
 
     {
-      ZoneScopedN("Wait on low latency semaphores");
-
-      uint64_t semaphoreValue = s_frameCount; // Previous frame's presentID
-      VkLatencySleepInfoNV sleepInfo{};
-      sleepInfo.sType = VK_STRUCTURE_TYPE_LATENCY_SLEEP_INFO_NV;
-      sleepInfo.signalSemaphore = vk.lowLatencySemaphores[resourceIdx];
-      sleepInfo.value = semaphoreValue;
-      vkLatencySleepNV(vk.device, windows[0].swapchain, &sleepInfo);
-
-      VkSemaphoreWaitInfo waitInfo{};
-      waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-      waitInfo.semaphoreCount = 1;
-      waitInfo.pSemaphores = &vk.lowLatencySemaphores[resourceIdx];
-      waitInfo.pValues = &semaphoreValue;
-
-      vkWaitSemaphores(vk.device, &waitInfo, 1000000000);
-    }
-
-    latencyMarkerInfo.marker = VK_LATENCY_MARKER_SIMULATION_START_NV;
-    vkSetLatencyMarkerNV(vk.device, windows[0].swapchain, &latencyMarkerInfo);
-
-    std::vector<uint32_t> imageIdxs(windows.size());
-    for (size_t i = 0; i < windows.size(); i++) {
-      Window &window = windows[i];
-      ZoneScopedN("draw loop");
-      ZoneTextF("Window %d", i);
-
-      {
-        ZoneScopedN("Wait on acquire fence");
-        // Ensure that the semaphore we're about to re-use is unsignaled and free of dependencies,
-        // by waiting for the fence that was signaled at the same time as the semaphore was signaled (as I understand it.)
-        assert_vk(vkWaitForFences(vk.device, 1, &window.acquireFences[resourceIdx], true, UINT64_MAX));
-        assert_vk(vkResetFences(vk.device, 1, &window.acquireFences[resourceIdx]));
+      ZoneScopedN("wait for frame fence");
+      // Wait to ensure that the resources we're about to use are unused.
+      if (dx.fence->GetCompletedValue() < dx.fenceValues[resourceIdx]) {
+        assert_hr(dx.fence->SetEventOnCompletion(dx.fenceValues[resourceIdx], dx.fenceEvent));
+        WaitForSingleObjectEx(dx.fenceEvent, INFINITE, false);
       }
 
-      uint32_t imageIdx;
-      assert_vk(vkAcquireNextImageKHR(vk.device, window.swapchain, UINT64_MAX,
-                            window.acquireSemaphores[resourceIdx], window.acquireFences[resourceIdx], &imageIdx));
-      imageIdxs[i] = imageIdx;
+      // We advance our fence value right before we signal it. This should help to avoid writing code that waits on a
+      // value that hasn't been signaled.
+    }
 
-      float rect[4] = {
-        (float) window.width / 2.0f, (float) (window.height - linePos % window.height),
-        (float) window.width, 100
-      };
-      rect[1] -= rect[3] / 2;
+    for (uint32_t winIdx = 0; winIdx < windows.size(); winIdx++) {
+      if (windows[winIdx].resizeBuffers) {
+        OnResize(winIdx);
+      }
+    }
 
-      ShaderData shaderData;
-      shaderData.rectXform = glm::mat4(1.0f);
-      shaderData.rectXform[0][0] = 2.0f * rect[2] / (float) window.width;
-      shaderData.rectXform[1][1] = 2.0f * rect[3] / (float) window.height;
-      shaderData.rectXform[3][0] =
-        -rect[2] / (float) window.width + (rect[0] - (float) window.width / 2) / ((float) window.width / 2);
-      shaderData.rectXform[3][1] =
-        -rect[3] / (float) window.height + (rect[1] - (float) window.height / 2) / ((float) window.height / 2);
-      shaderData.maxMetaLoop = 1;
-      memcpy(window.shaderDataBuffers[resourceIdx].mapped, &shaderData, sizeof(shaderData));
+    for (uint32_t winIdx = 0; winIdx < windows.size(); winIdx++) {
+
+      Window& window = windows[winIdx];
+      {
+        float rect[4] = {
+          (float) window.width / 2.0f, (float) (window.height - linePos % window.height),
+          (float) window.width, 100
+        };
+
+        float matrix[9] = {
+          rect[2]/(float)window.width, 0.0f,                               2.0f*rect[0]/(float)window.width  - 1.0f,
+          0.0f,                              rect[3]/(float)window.height, 2.0f*rect[1]/(float)window.height - 1.0f,
+          0.0f,                              0.0f,                         1.0f,
+        };
+
+        ShaderData shaderData{};
+        memcpy(shaderData.rectXform_r1, &matrix[0], sizeof(float) * 3);
+        memcpy(shaderData.rectXform_r2, &matrix[3], sizeof(float) * 3);
+        memcpy(shaderData.rectXform_r3, &matrix[6], sizeof(float) * 3);
+        shaderData.metaLoopCount = 600;
+
+        memcpy(window.mappedShaderDatas[resourceIdx], &shaderData, sizeof(shaderData));
+      }
 
       {
-        ZoneScopedN("buffer prepare & submit");
-        ZoneTextF("Resource idx: %d", resourceIdx);
-        VkCommandBuffer cb = window.commandBuffers[resourceIdx];
-        vkResetCommandBuffer(cb, 0);
+        ZoneScopedN("Record commands");
 
-        VkCommandBufferBeginInfo cbBI{};
-        cbBI.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        cbBI.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cb, &cbBI);
+        assert_hr(window.commandAllocators[resourceIdx]->Reset());
+        assert_hr(window.commandList->Reset(window.commandAllocators[resourceIdx].get(), dx.pipelineState.get()));
+        window.commandList->SetGraphicsRootSignature(dx.rootSignature.get());
 
-        {
-          TracyVkZone(vk.tracyCtx, cb, "rendering");
+        ID3D12DescriptorHeap* heaps[] = { dx.cbvHeap.get() };
+        window.commandList->SetDescriptorHeaps(static_cast<UINT>(ArrayCount(heaps)), heaps);
 
-          VkImageMemoryBarrier2 outputBarrier{};
-          outputBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-          outputBarrier.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-          outputBarrier.srcAccessMask = 0;
-          outputBarrier.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-          outputBarrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-          outputBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-          outputBarrier.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
-          outputBarrier.image = window.swapchainImages[imageIdx];
-          outputBarrier.subresourceRange = VkImageSubresourceRange{};
-          outputBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-          outputBarrier.subresourceRange.levelCount = 1;
-          outputBarrier.subresourceRange.layerCount = 1;
+        CD3DX12_GPU_DESCRIPTOR_HANDLE cbvHandle(dx.cbvHeap->GetGPUDescriptorHandleForHeapStart(),
+                                                winIdx * maxFramesInFlight + resourceIdx, dx.cbvDescriptorSize);
+        window.commandList->SetGraphicsRootDescriptorTable(0, cbvHandle);
 
-          VkDependencyInfo outputBarrierDI{};
-          outputBarrierDI.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-          outputBarrierDI.imageMemoryBarrierCount = 1;
-          outputBarrierDI.pImageMemoryBarriers = &outputBarrier;
-          vkCmdPipelineBarrier2(cb, &outputBarrierDI);
+        CD3DX12_VIEWPORT viewport(0.0f, 0.0f, static_cast<float>(window.width), static_cast<float>(window.height));
+        CD3DX12_RECT scissorRect(0, 0, window.width, window.height);
+        window.commandList->RSSetViewports(1, &viewport);
+        window.commandList->RSSetScissorRects(1, &scissorRect);
 
-          VkRenderingAttachmentInfo colorAttachmentInfo{};
-          colorAttachmentInfo.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-          colorAttachmentInfo.imageView = window.swapchainImageViews[imageIdx];
-          colorAttachmentInfo.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
-          colorAttachmentInfo.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-          colorAttachmentInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-          colorAttachmentInfo.clearValue = VkClearValue{};
-          colorAttachmentInfo.clearValue.color = VkClearColorValue{0.0f, 0.0f, 0.0f, 1.0f};
+        UINT backbufferIdx = window.swapchain->GetCurrentBackBufferIndex();
+        auto presentToRt = CD3DX12_RESOURCE_BARRIER::Transition(window.renderTargets[backbufferIdx].get(),
+                                                                D3D12_RESOURCE_STATE_PRESENT,
+                                                                D3D12_RESOURCE_STATE_RENDER_TARGET);
+        window.commandList->ResourceBarrier(1, &presentToRt);
 
-          VkRenderingInfo renderingInfo{};
-          renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-          renderingInfo.renderArea = VkRect2D{};
-          renderingInfo.renderArea.extent = VkExtent2D{(uint32_t) window.width, (uint32_t) window.height};
-          renderingInfo.layerCount = 1;
-          renderingInfo.colorAttachmentCount = 1;
-          renderingInfo.pColorAttachments = &colorAttachmentInfo;
-          vkCmdBeginRendering(cb, &renderingInfo);
+        CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(dx.rtvHeap->GetCPUDescriptorHandleForHeapStart(),
+                                                winIdx * numBackbuffers + backbufferIdx, dx.rtvDescriptorSize);
+        window.commandList->OMSetRenderTargets(1, &rtvHandle, false, nullptr);
 
-          VkViewport vp{};
-          vp.width = static_cast<float>(window.width);
-          vp.height = static_cast<float>(window.height);
-          vp.minDepth = 0.0f;
-          vp.maxDepth = 1.0f;
-          vkCmdSetViewport(cb, 0, 1, &vp);
-          VkRect2D scissor{};
-          scissor.extent = VkExtent2D{(uint32_t) window.width, (uint32_t) window.height};
-          vkCmdSetScissor(cb, 0, 1, &scissor);
+        const float clearColor[] = { 0.0f, 0.2f, 0.4f, 1.0f };
+        window.commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+        window.commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        window.commandList->IASetVertexBuffers(0, 1, &dx.vertexBufferView);
+        window.commandList->DrawInstanced(6, 1, 0, 0);
 
-          vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.pipeline);
-          VkDeviceSize vOffset = 0;
-          vkCmdBindVertexBuffers(cb, 0, 1, &vk.vBuffer, &vOffset);
-          vkCmdBindIndexBuffer(cb, vk.vBuffer, vk.vDataSize, VK_INDEX_TYPE_UINT16);
+        auto rtToPresent = CD3DX12_RESOURCE_BARRIER::Transition(window.renderTargets[backbufferIdx].get(),
+                                                                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                                D3D12_RESOURCE_STATE_PRESENT);
+        window.commandList->ResourceBarrier(1, &rtToPresent);
 
-          vkCmdPushConstants(cb, vk.pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                             sizeof(VkDeviceAddress), &window.shaderDataBuffers[resourceIdx].deviceAddress);
-
-          vkCmdDrawIndexed(cb, vk.numIndices, 1, 0, 0, 0);
-          vkCmdEndRendering(cb);
-
-          VkImageMemoryBarrier2 barrierPresent{};
-          barrierPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-          barrierPresent.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-          barrierPresent.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-          barrierPresent.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-          barrierPresent.dstAccessMask = 0;
-          barrierPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-          barrierPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-          barrierPresent.image = window.swapchainImages[imageIdx];
-          barrierPresent.subresourceRange = VkImageSubresourceRange{};
-          barrierPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-          barrierPresent.subresourceRange.levelCount = 1;
-          barrierPresent.subresourceRange.layerCount = 1;
-
-          VkDependencyInfo barrierPresentDI{};
-          barrierPresentDI.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-          barrierPresentDI.imageMemoryBarrierCount = 1;
-          barrierPresentDI.pImageMemoryBarriers = &barrierPresent;
-          vkCmdPipelineBarrier2(cb, &barrierPresentDI);
-
-        }
-
-        vkEndCommandBuffer(cb);
-
-        VkLatencySubmissionPresentIdNV latencyInfo{};
-        latencyInfo.sType = VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV;
-        latencyInfo.presentID = presentId;
-
-        VkPipelineStageFlags waitStages = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        VkSubmitInfo submitInfo{};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        submitInfo.pNext = &latencyInfo;
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = &window.acquireSemaphores[resourceIdx];
-        submitInfo.pWaitDstStageMask = &waitStages;
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &cb;
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = &window.renderSemaphores[imageIdx];
-        assert_vk(vkQueueSubmit(vk.queue, 1, &submitInfo, window.renderFences[resourceIdx]));
+        assert_hr(window.commandList->Close());
       }
     }
 
     {
-      ZoneScopedN("queue present");
-      ZoneTextF("presentID: %llu", presentId);
-      {
-        char imgIdxList[128];
-        int c = 0;
-        c += snprintf(imgIdxList, ArrayCount(imgIdxList), "Image idxs: ");
-        for (size_t i = 0; i < windows.size(); i++) {
-          c += snprintf(imgIdxList + c, ArrayCount(imgIdxList) - c, "%d%s", imageIdxs[i], i < (windows.size() - 1) ? ", " : "\n");
-        }
-        ZoneTextF("%s", imgIdxList);
+      ZoneScopedN("Execute command lists");
+      std::vector<ID3D12CommandList*> commandLists;
+      commandLists.reserve(windows.size());
+      for (size_t i = 0; i < windows.size(); i++) {
+        commandLists.push_back(windows[i].commandList.get());
       }
-
-      uint32_t swapchainCount = static_cast<uint32_t>(windows.size());
-      std::vector<VkSemaphore> semaphores(swapchainCount);
-      std::vector<VkSwapchainKHR> swapchains(swapchainCount);
-      std::vector<uint64_t> presentIds(swapchainCount);
-      for (size_t i = 0; i < swapchainCount; i++) {
-        semaphores[i] = windows[i].renderSemaphores[imageIdxs[i]];
-        swapchains[i] = windows[i].swapchain;
-        presentIds[i] = presentId;
-      }
-
-      VkPresentIdKHR presentIdInfo{};
-      presentIdInfo.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
-      presentIdInfo.swapchainCount = swapchainCount;
-      presentIdInfo.pPresentIds = presentIds.data();
-
-      VkPresentInfoKHR presentInfo{};
-      presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-      presentInfo.pNext = &presentIdInfo;
-      presentInfo.waitSemaphoreCount = static_cast<uint32_t>(semaphores.size());
-      presentInfo.pWaitSemaphores = semaphores.data();
-      presentInfo.swapchainCount = swapchainCount;
-      presentInfo.pSwapchains = swapchains.data();
-      presentInfo.pImageIndices = imageIdxs.data();
-
-      latencyMarkerInfo.marker = VK_LATENCY_MARKER_PRESENT_START_NV;
-      vkSetLatencyMarkerNV(vk.device, windows[0].swapchain, &latencyMarkerInfo);
-      assert_vk(vkQueuePresentKHR(vk.queue, &presentInfo));
-      latencyMarkerInfo.marker = VK_LATENCY_MARKER_PRESENT_END_NV;
-      vkSetLatencyMarkerNV(vk.device, windows[0].swapchain, &latencyMarkerInfo);
+      dx.commandQueue->ExecuteCommandLists(static_cast<UINT>(commandLists.size()), commandLists.data());
     }
+
+    {
+      for (size_t i = 0; i < windows.size(); i++) {
+        Window& window = windows[i];
+
+        ZoneScopedN("Present");
+        ZoneTextF("Window %zu", i);
+        assert_hr(window.swapchain->Present(1, 0));
+      }
+    }
+
+    // Queue a frame completion signal
+    dx.fenceValues[resourceIdx] = dx.nextFenceValue;
+    dx.nextFenceValue++;
+    assert_hr(dx.commandQueue->Signal(dx.fence.get(), dx.fenceValues[resourceIdx]));
 
     PumpMessages();
 
@@ -1204,121 +922,64 @@ int main(int argc, const char** argv)
         s_drainPresentQueue = false;
       }
     }
-
-    latencyMarkerInfo.marker = VK_LATENCY_MARKER_SIMULATION_END_NV;
-    vkSetLatencyMarkerNV(vk.device, windows[0].swapchain, &latencyMarkerInfo);
-
-    TracyVkCollectHost(vk.tracyCtx);
-
-    {
-      VkGetLatencyMarkerInfoNV markerInfo{};
-      markerInfo.sType = VK_STRUCTURE_TYPE_GET_LATENCY_MARKER_INFO_NV;
-      vkGetLatencyTimingsNV(vk.device, windows[0].swapchain, &markerInfo);
-
-      latencyReports.resize(markerInfo.timingCount);
-      markerInfo.pTimings = latencyReports.data();
-      vkGetLatencyTimingsNV(vk.device, windows[0].swapchain, &markerInfo);
-
-      if (markerInfo.timingCount > 0) {
-        uint32_t reportIdx = markerInfo.timingCount - 1;
-        for (; reportIdx >= 0; reportIdx--) {
-          if (latencyReports[reportIdx].presentID <= loggedLatencyPresentId) break;
-        }
-
-        if (reportIdx < markerInfo.timingCount - 1) {
-          reportIdx++;
-        }
-
-        Log("Latency reports:");
-        for (; reportIdx < markerInfo.timingCount; reportIdx++) {
-          if (reportIdx > 0) {
-            VkLatencyTimingsFrameReportNV diff{};
-            diff.inputSampleTimeUs =        latencyReports[reportIdx].inputSampleTimeUs        - latencyReports[reportIdx - 1].inputSampleTimeUs;
-            diff.simStartTimeUs =           latencyReports[reportIdx].simStartTimeUs           - latencyReports[reportIdx - 1].simStartTimeUs;
-            diff.simEndTimeUs =             latencyReports[reportIdx].simEndTimeUs             - latencyReports[reportIdx - 1].simEndTimeUs;
-            diff.renderSubmitStartTimeUs =  latencyReports[reportIdx].renderSubmitStartTimeUs  - latencyReports[reportIdx - 1].renderSubmitStartTimeUs;
-            diff.renderSubmitEndTimeUs =    latencyReports[reportIdx].renderSubmitEndTimeUs    - latencyReports[reportIdx - 1].renderSubmitEndTimeUs;
-            diff.presentStartTimeUs =       latencyReports[reportIdx].presentStartTimeUs       - latencyReports[reportIdx - 1].presentStartTimeUs;
-            diff.presentEndTimeUs =         latencyReports[reportIdx].presentEndTimeUs         - latencyReports[reportIdx - 1].presentEndTimeUs;
-            diff.driverStartTimeUs =        latencyReports[reportIdx].driverStartTimeUs        - latencyReports[reportIdx - 1].driverStartTimeUs;
-            diff.driverEndTimeUs =          latencyReports[reportIdx].driverEndTimeUs          - latencyReports[reportIdx - 1].driverEndTimeUs;
-            diff.osRenderQueueStartTimeUs = latencyReports[reportIdx].osRenderQueueStartTimeUs - latencyReports[reportIdx - 1].osRenderQueueStartTimeUs;
-            diff.osRenderQueueEndTimeUs =   latencyReports[reportIdx].osRenderQueueEndTimeUs   - latencyReports[reportIdx - 1].osRenderQueueEndTimeUs;
-            diff.gpuRenderStartTimeUs =     latencyReports[reportIdx].gpuRenderStartTimeUs     - latencyReports[reportIdx - 1].gpuRenderStartTimeUs;
-            diff.gpuRenderEndTimeUs =       latencyReports[reportIdx].gpuRenderEndTimeUs       - latencyReports[reportIdx - 1].gpuRenderEndTimeUs;
-
-            Log("presentID %llu > presentID %llu:\n"
-                "  Δ simStartTime:       %fms\n"
-                "  Δ presentStartTime:   %fms\n"
-                "  Δ gpuRenderStartTime: %fms\n",
-                latencyReports[reportIdx-1].presentID, latencyReports[reportIdx].presentID,
-                (double)diff.simStartTimeUs       / 1000.0,
-                (double)diff.presentStartTimeUs   / 1000.0,
-                (double)diff.gpuRenderStartTimeUs / 1000.0);
-          }
-
-          auto& rep = latencyReports[reportIdx];
-          uint64_t simDur           = rep.simEndTimeUs           - rep.simStartTimeUs;
-          uint64_t presentDur       = rep.presentEndTimeUs       - rep.presentStartTimeUs;
-          uint64_t driverDur        = rep.driverEndTimeUs        - rep.driverStartTimeUs;
-          uint64_t osRenderQueueDur = rep.osRenderQueueEndTimeUs - rep.osRenderQueueStartTimeUs;
-          uint64_t gpuRenderDur     = rep.gpuRenderEndTimeUs     - rep.gpuRenderStartTimeUs;
-          Log("presentID %llu:\n"
-              "  simStart > renderEnd: %fms\n"
-              "  sim: %fms\n"
-              "  present: %fms\n"
-              "  driver: %fms\n"
-              "  osRenderQueue: %fms\n"
-              "  gpuRender: %fms\n",
-              rep.presentID,
-              (double)(rep.gpuRenderEndTimeUs - rep.simStartTimeUs) / 1000.0,
-              (double)simDur           / 1000.0,
-              (double)presentDur       / 1000.0,
-              (double)driverDur        / 1000.0,
-              (double)osRenderQueueDur / 1000.0,
-              (double)gpuRenderDur     / 1000.0);
-        }
-
-        loggedLatencyPresentId = latencyReports[markerInfo.timingCount - 1].presentID;
-      }
-    }
   }
 
-  assert_vk(vkDeviceWaitIdle(vk.device));
-  for (Window& window : windows) {
-    for (auto i = 0; i < maxFramesInFlight; i++) {
-      vkDestroyFence(vk.device, window.acquireFences[i], nullptr);
-      vkDestroyFence(vk.device, window.renderFences[i], nullptr);
-      vkDestroySemaphore(vk.device, window.acquireSemaphores[i], nullptr);
-      vkDestroySemaphore(vk.device, window.renderSemaphores[i], nullptr);
-      vmaUnmapMemory(vk.allocator, window.shaderDataBuffers[i].allocation);
-      vmaDestroyBuffer(vk.allocator, window.shaderDataBuffers[i].buffer, window.shaderDataBuffers[i].allocation);
-    }
-    for (VkImageView& view : window.swapchainImageViews) {
-      vkDestroyImageView(vk.device, view, nullptr);
-    }
-
-    vkDestroySwapchainKHR(vk.device, window.swapchain, nullptr);
-    vkDestroySurfaceKHR(vk.instance, window.surface, nullptr);
+  // Wait for the last submitted frame to finish rendering before freeing resources.
+  UINT resourceIdx = (s_frameCount - 1) % maxFramesInFlight; // Account for s_frameCount being incremented at the end of the main loop.
+  if (dx.fence->GetCompletedValue() < dx.fenceValues[resourceIdx]) {
+    assert_hr(dx.fence->SetEventOnCompletion(dx.fenceValues[resourceIdx], dx.fenceEvent));
+    WaitForSingleObjectEx(dx.fenceEvent, INFINITE, false);
   }
 
-  for (auto i = 0; i < maxFramesInFlight; i++) {
-    vkDestroySemaphore(vk.device, vk.lowLatencySemaphores[i], nullptr);
+  // Make sure all swapchains are out of fullscreen before cleaning them up, since destroying a swapchain in fullscreen
+  // mode is an error.
+  for (size_t i = 0; i < windows.size(); i++) {
+    Window& window = windows[i];
+    BOOL fullscreen;
+    window.swapchain->GetFullscreenState(&fullscreen, nullptr);
+    if (fullscreen) {
+      window.swapchain->SetFullscreenState(false, nullptr);
+    }
   }
-
-  vmaDestroyBuffer(vk.allocator, vk.vBuffer, vk.vBufferAlloc);
-  vkDestroyPipelineLayout(vk.device, vk.pipelineLayout, nullptr);
-  vkDestroyPipeline(vk.device, vk.pipeline, nullptr);
-  vkDestroyCommandPool(vk.device, vk.commandPool, nullptr);
-  vkDestroyShaderModule(vk.device, vk.shaderModule, nullptr);
-  vmaDestroyAllocator(vk.allocator);
-  TracyVkDestroy(vk.tracyCtx);
-  vkDestroyDevice(vk.device, nullptr);
-  vkDestroyInstance(vk.instance, nullptr);
 
   for (Window& window : windows) {
     destroyWindow(window);
   }
 
   return EXIT_SUCCESS;
+}
+
+static void OnResize(size_t winIdx)
+{
+  Window& window = windows[winIdx];
+
+  if (!window.swapchain) return;
+
+  uint64_t lastFence = 0;
+  for (size_t i = 0; i < maxFramesInFlight; i++) {
+    lastFence = std::max(lastFence, dx.fenceValues[i]);
+  }
+  if (dx.fence->GetCompletedValue() < lastFence) {
+    assert_hr(dx.fence->SetEventOnCompletion(lastFence, dx.fenceEvent));
+    WaitForSingleObjectEx(dx.fenceEvent, INFINITE, false);
+  }
+
+  // Release resources held by the swapchain before resizing
+  for (size_t i = 0; i < ArrayCount(window.renderTargets); i++) {
+    window.renderTargets[i] = nullptr; // .release() doesn't actually decref and thus release the pointer
+  }
+
+  DXGI_SWAP_CHAIN_DESC desc{};
+  window.swapchain->GetDesc(&desc);
+  assert_hr(window.swapchain->ResizeBuffers(desc.BufferCount, window.width, window.height, desc.BufferDesc.Format, desc.Flags));
+
+  CD3DX12_CPU_DESCRIPTOR_HANDLE rtvHandle(dx.rtvHeap->GetCPUDescriptorHandleForHeapStart());
+  rtvHandle.Offset(static_cast<INT>(winIdx * numBackbuffers), dx.rtvDescriptorSize);
+  for (uint32_t i = 0; i < numBackbuffers; i++) {
+    assert_hr(window.swapchain->GetBuffer(i, IID_PPV_ARGS(&window.renderTargets[i])));
+    dx.device->CreateRenderTargetView(window.renderTargets[i].get(), nullptr, rtvHandle);
+    rtvHandle.Offset(1, dx.rtvDescriptorSize);
+  }
+
+  window.resizeBuffers = false;
 }

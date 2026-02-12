@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(vkPresentLatency C CXX)
+project(multiWindowSync C CXX)
 
 # Common directories.
 set(BIN_DIR  ${CMAKE_CURRENT_BINARY_DIR}/bin)
@@ -27,17 +27,11 @@ if(WIN32)
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 endif()
 
-# Volk
-set(VOLK_STATIC_DEFINES VK_USE_PLATFORM_WIN32_KHR)
-add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/volk")
-
-find_package(Vulkan REQUIRED)
-message("Vulkan_LIBRARY=${Vulkan_LIBRARY}")
-find_library(Slang_LIBRARY NAMES slang HINTS "$ENV{VULKAN_SDK}/lib" REQUIRED)
-
+# Agility SDK
+add_subdirectory(DirectXAgilitySDK)
 
 ### Executable
-set(exec_target vkPresentLatency)
+set(exec_target multiWindowSync)
 
 add_executable(${exec_target})
 target_sources(${exec_target}
@@ -46,14 +40,23 @@ target_sources(${exec_target}
 
 target_compile_definitions(${exec_target}
   PRIVATE
-  TRACY_IMPORTS
-  VK_NO_PROTOTYPES) # We only want to call functions exposed by Volk
+  TRACY_IMPORTS)
 
   
 target_link_libraries(${exec_target}
   PRIVATE
   Tracy::TracyClient
-  # We don't use Vulkan::Vulkan because that would link against vulkan-1, which we do not want when using Volk.
-  Vulkan::Headers
-  ${Slang_LIBRARY}
-  volk::volk)
+  d3d12
+  dxgi
+  d3dcompiler
+  agilitysdk
+  agilitysdk_d3dx12)
+
+# Copy Agility SDK DLLs to correct location & pass version to the target
+# See https://devblogs.microsoft.com/directx/gettingstarted-dx12agility/ for more info
+add_custom_command(TARGET ${exec_target} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${exec_target}>/D3D12/"
+        COMMAND ${CMAKE_COMMAND} -E copy        -t "$<TARGET_FILE_DIR:${exec_target}>/D3D12/" ${AGILITYSDK_D3D12CORE_DLL}
+        COMMAND ${CMAKE_COMMAND} -E copy        -t "$<TARGET_FILE_DIR:${exec_target}>/D3D12/" ${AGILITYSDK_D3D12SDKLAYERS_DLL}
+        COMMAND_EXPAND_LISTS
+)
